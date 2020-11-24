@@ -52,9 +52,11 @@ import os
 
 summary = tf.contrib.summary  # TensorFlow Summary API v2.
 
+from tensorflow.python.ops.summary_ops_v2 import record_if
+
 
 TpuSummaryEntry = collections.namedtuple(
-    "TpuSummaryEntry", "summary_fn name tensor reduce_fn")
+    "TpuSummaryEntry", "summary_fn name tensor reduce_fn countdown init")
 
 @gin.configurable(blacklist=["log_dir"])
 class TpuSummaries(object):
@@ -66,7 +68,7 @@ class TpuSummaries(object):
   all the TPU cores.
   """
 
-  def __init__(self, log_dir, save_summary_steps=1, save_image_steps=50):
+  def __init__(self, log_dir, save_summary_steps=1, save_image_steps=50, append_shapes=False):
     self._log_dir = log_dir
     self._image_entries = []
     self._scalar_entries = []
@@ -75,6 +77,7 @@ class TpuSummaries(object):
     self.record = True
     self._save_summary_steps = save_summary_steps
     self._save_image_steps = save_image_steps
+    self._append_shapes = append_shapes
     #assert TpuSummaries.inst is None
     TpuSummaries.inst = self
 
@@ -91,10 +94,13 @@ class TpuSummaries(object):
     if self.has(name):
       logging.info("TpuSummaries.image: skipping duplicate %s", name)
     else:
+      tensor = tf.convert_to_tensor(tensor)
+      if self._append_shapes:
+        name += '_' + '{}'.format(tensor.shape).strip('()').replace(', ', 'x')
       self._image_entries.append(
-          TpuSummaryEntry(summary.image, name, tensor, reduce_fn))
+          TpuSummaryEntry(summary.image, name, tensor, reduce_fn, countdown=None, init=None))
 
-  def scalar(self, name, tensor, reduce_fn=tf.math.reduce_mean):
+  def scalar(self, name, tensor, reduce_fn=tf.math.reduce_mean, countdown=None, init=None):
     """Add a summary for a scalar tensor."""
     if not self.record:
       return
@@ -102,10 +108,12 @@ class TpuSummaries(object):
       logging.info("TpuSummaries.scalar: skipping duplicate %s", name)
     else:
       tensor = tf.convert_to_tensor(tensor)
+      if self._append_shapes:
+        name += '_' + '{}'.format(tensor.shape).strip('()').replace(', ', 'x')
       if tensor.shape.ndims == 0:
         tensor = tf.expand_dims(tensor, 0)
       self._scalar_entries.append(
-          TpuSummaryEntry(summary.scalar, name, tensor, reduce_fn))
+          TpuSummaryEntry(summary.scalar, name, tensor, reduce_fn, countdown, init))
 
   def get_host_call(self):
     """Returns the tuple (host_call_fn, host_call_args) for TPUEstimatorSpec."""
@@ -139,7 +147,27 @@ class TpuSummaries(object):
             self._save_summary_steps, step):
         for i, e in enumerate(self._scalar_entries):
           value = e.reduce_fn(args[i + offset])
-          e.summary_fn(e.name, value, step=step)
+          ready = None
+          if e.countdown is not None:
+            with tf.device("cpu:0"):
+              countdown = tf.get_local_variable(
+                e.name + "_countdown",
+                initializer=tf.constant_initializer(e.countdown),
+                shape=(),
+                dtype=tf.int64,
+                trainable=False,
+                use_resource=True)
+              countdown_decrement = countdown.assign_sub(tf.sign(countdown))
+              with tf.control_dependencies([countdown_decrement]):
+                ready = tf.less_equal(countdown, 0)
+          if e.init is not None and False: # Disable this for now
+            op = tf.reduce_any(tf.not_equal(value, tf.cast(e.init, value.dtype)))
+            ready = tf.logical_and(ready, op) if ready is not None else op
+          if ready is not None:
+            with record_if(ready):
+              e.summary_fn(e.name, value, step=step)
+          else:
+            e.summary_fn(e.name, value, step=step)
       offset += len(self._scalar_entries)
       ops.append(summary.all_summary_ops())
     return tf.group(ops)

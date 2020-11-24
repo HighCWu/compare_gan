@@ -33,6 +33,7 @@ import functools
 
 from absl import logging
 
+from compare_gan.architectures import arch_ops
 from compare_gan.gans import consts
 from compare_gan.tpu import tpu_ops
 import gin
@@ -41,6 +42,18 @@ import tensorflow as tf
 
 from tensorflow.contrib.tpu.python.tpu import tpu_function
 from tensorflow.python.training import moving_averages  # pylint: disable=g-direct-tensorflow-import
+
+import functools
+
+
+def op_scope(fn, name=None):
+    if name is None:
+        name = fn.__name__
+    @functools.wraps(fn)
+    def _fn(*args, **kwargs):
+        with tf.name_scope(fn.__name__):
+            return fn(*args, **kwargs)
+    return _fn
 
 
 use_assign_forbidden = False
@@ -90,19 +103,21 @@ def _moving_moments_for_inference(mean, variance, is_training, decay):
   moving_mean = tf.get_variable(
       "moving_mean",
       shape=mean.shape,
-      initializer=tf.zeros_initializer(),
+      initializer=arch_ops.zeros_initializer(),
       trainable=False,
       partitioner=None,
       collections=variable_collections)
+  moving_mean = graph_spectral_norm(moving_mean, init=0.0)
   moving_variance = tf.get_variable(
       "moving_variance",
       shape=variance.shape,
-      initializer=tf.ones_initializer(),
+      initializer=arch_ops.ones_initializer(),
       trainable=False,
       partitioner=None,
       collections=variable_collections)
+  moving_variance = graph_spectral_norm(moving_variance, init=1.0)
   if is_training:
-    logging.debug("Adding update ops for moving averages of mean and variance.")
+    logging.info("Adding update ops for moving averages of mean and variance.")
     # Update variables for mean and variance during training.
     update_moving_mean = moving_averages.assign_moving_average(
         moving_mean,
@@ -117,7 +132,7 @@ def _moving_moments_for_inference(mean, variance, is_training, decay):
     tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, update_moving_mean)
     tf.add_to_collection(tf.GraphKeys.UPDATE_OPS, update_moving_variance)
     return mean, variance
-  logging.debug("Using moving mean and variance.")
+  logging.info("Using moving mean and variance.")
   return moving_mean, moving_variance
 
 
@@ -147,13 +162,13 @@ def _accumulated_moments_for_inference(mean, variance, is_training):
     accu_mean = tf.get_variable(
         "accu_mean",
         shape=mean.shape,
-        initializer=tf.zeros_initializer(),
+        initializer=arch_ops.zeros_initializer(),
         trainable=False,
         collections=variable_collections)
     accu_variance = tf.get_variable(
         "accu_variance",
         shape=variance.shape,
-        initializer=tf.zeros_initializer(),
+        initializer=arch_ops.zeros_initializer(),
         trainable=False,
         collections=variable_collections)
     accu_counter = tf.get_variable(
@@ -166,7 +181,7 @@ def _accumulated_moments_for_inference(mean, variance, is_training):
         "update_accus",
         shape=[],
         dtype=tf.int32,
-        initializer=tf.zeros_initializer(),
+        initializer=arch_ops.zeros_initializer(),
         trainable=False,
         collections=variable_collections)
 
@@ -174,9 +189,13 @@ def _accumulated_moments_for_inference(mean, variance, is_training):
     variance = tf.identity(variance, "variance")
 
     if is_training:
+      mean = graph_spectral_norm(mean)
+      variance = graph_spectral_norm(variance)
       return mean, variance
 
-    logging.debug("Using accumulated moments.")
+    logging.info("Using accumulated moments.")
+    accu_mean = graph_spectral_norm(accu_mean, init=0.0)
+    accu_variance = graph_spectral_norm(accu_variance, init=0.0)
     # Return the accumulated batch statistics and add current batch statistics
     # to accumulators if update_accus variables equals 1.
     def update_accus_fn():
@@ -268,7 +287,7 @@ def standardize_batch(inputs,
     # Default to global batch norm only on TPUs.
     use_cross_replica_mean = (
         tpu_function.get_tpu_context().number_of_shards is not None)
-    logging.debug("Automatically determined use_cross_replica_mean=%s.",
+    logging.info("Automatically determined use_cross_replica_mean=%s.",
                   use_cross_replica_mean)
 
   inputs = tf.convert_to_tensor(inputs)
@@ -364,14 +383,16 @@ def batch_norm(inputs, is_training, center=True, scale=True, name="batch_norm"):
           "gamma",
           [num_channels],
           collections=collections,
-          initializer=tf.ones_initializer())
+          initializer=arch_ops.ones_initializer())
+      gamma = graph_spectral_norm(gamma, init=1.0)
       outputs *= gamma
     if center:
       beta = tf.get_variable(
           "beta",
           [num_channels],
           collections=collections,
-          initializer=tf.zeros_initializer())
+          initializer=arch_ops.zeros_initializer())
+      beta = graph_spectral_norm(beta, init=0.0)
       outputs += beta
     return outputs
 
@@ -481,7 +502,8 @@ def evonorm_s0(inputs,
           "gamma",
           [num_channels],
           collections=collections,
-          initializer=tf.ones_initializer())
+          initializer=arch_ops.ones_initializer())
+        gamma = graph_spectral_norm(gamma, init=1.0)
         outputs *= gamma
 
       if center:
@@ -489,7 +511,8 @@ def evonorm_s0(inputs,
           "beta",
           [num_channels],
           collections=collections,
-          initializer=tf.zeros_initializer())
+          initializer=arch_ops.zeros_initializer())
+        beta = graph_spectral_norm(beta, init=0.0)
         outputs += beta
 
       outputs = tf.cast(outputs, inputs_dtype)
@@ -509,7 +532,9 @@ def group_std(x, groups=32, eps=1e-5):
   return tf.reshape(std, [N, H, W, C])
 
 def trainable_variable_ones(shape, name="v"):
-  return tf.get_variable(name, shape=shape, initializer=tf.ones_initializer())
+  x = tf.get_variable(name, shape=shape, initializer=arch_ops.ones_initializer())
+  x = graph_spectral_norm(x, init=1.0)
+  return x
 
 #/ evonorm functions
 
@@ -544,7 +569,8 @@ def layer_norm(input_, is_training, scope):
 
 
 @gin.configurable(blacklist=["inputs"])
-def spectral_norm(inputs, epsilon=1e-12, singular_value="left"):
+def spectral_norm(inputs, epsilon=1e-12, singular_value="auto", use_resource=True,
+                  save_in_checkpoint=False, power_iteration_rounds=2):
   """Performs Spectral Normalization on a weight tensor.
 
   Details of why this is helpful for GAN's can be found in "Spectral
@@ -560,9 +586,13 @@ def spectral_norm(inputs, epsilon=1e-12, singular_value="left"):
   Returns:
     The normalized weight tensor.
   """
-  if len(inputs.shape) < 2:
-    raise ValueError(
-        "Spectral norm can only be applied to multi-dimensional tensors")
+  # if len(inputs.shape) < 2:
+  #   raise ValueError(
+  #       "Spectral norm can only be applied to multi-dimensional tensors")
+
+  if len(inputs.shape) <= 0:
+    logging.info("[ops] spectral norm of a float is itself; returning as-is. name=%s %s", inputs.name, repr(inputs))
+    return inputs, inputs
 
   # The paper says to flatten convnet kernel weights from (C_out, C_in, KH, KW)
   # to (C_out, C_in * KH * KW). Our Conv2D kernel shape is (KH, KW, C_in, C_out)
@@ -587,14 +617,15 @@ def spectral_norm(inputs, epsilon=1e-12, singular_value="left"):
       shape=u_shape,
       dtype=w.dtype,
       initializer=tf.random_normal_initializer(),
-      #collections=[tf.GraphKeys.LOCAL_VARIABLES],
+      collections=None if save_in_checkpoint else [tf.GraphKeys.LOCAL_VARIABLES],
+      use_resource=use_resource,
       trainable=False)
   u = u_var
 
   # Use power iteration method to approximate the spectral norm.
   # The authors suggest that one round of power iteration was sufficient in the
   # actual experiment to achieve satisfactory performance.
-  power_iteration_rounds = 1
+  #power_iteration_rounds = 1
   for _ in range(power_iteration_rounds):
     if singular_value == "left":
       # `v` approximates the first right singular vector of matrix `w`.
@@ -633,23 +664,40 @@ def spectral_norm(inputs, epsilon=1e-12, singular_value="left"):
 
 from compare_gan.tpu import tpu_summaries
 
+def bias_name(name):
+  if name.endswith('/bias'):
+    parts = name.split('/')
+    return parts[0] + '_bias/' + '/'.join(parts[1:])
+  return name
+
 def graph_name(name):
   name = name.split(':')[0]
   name = name.split('/kernel')[0]
+  #name = name.replace('/ExponentialMovingAverage', '')
+  if '/ExponentialMovingAverage' in name:
+    return
   if name.startswith('generator/'):
     name = name.replace('generator/', '')
-    return 'G_' + name
-  elif name.startswith('discriminator/'):
+    name = bias_name(name)
+    if not name.startswith('G_'):
+      name = 'G_' + name
+    return name
+  if name.startswith('discriminator/'):
     name = name.replace('discriminator/', '')
-    return 'D_' + name
+    name = bias_name(name)
+    if not name.startswith('D_'):
+      name = 'D_' + name
+    return name
 
-def graph_spectral_norm(w):
+def graph_spectral_norm(w, init=None):
   name = graph_name(w.name)
   assert tpu_summaries.TpuSummaries.inst is not None
   if name is not None and not tpu_summaries.TpuSummaries.inst.has(name):
-    logging.info("[ops] Graphing spectral norm name=%s, %s", name, repr(w))
+    logging.info("[ops] Graphing name=%s (was %s), %s", name, w.name, repr(w))
     w1, norm = spectral_norm(w)
-    tpu_summaries.TpuSummaries.inst.scalar(name, norm)
+    tpu_summaries.TpuSummaries.inst.scalar(name, norm, countdown=2, init=init) # the specnorm needs a few iters to become accurate
+  else:
+    logging.info("[ops] Not graphing %s", w.name)
   return w
 
 def linear(inputs, output_size, scope=None, stddev=0.02, bias_start=0.0,
@@ -670,6 +718,7 @@ def linear(inputs, output_size, scope=None, stddev=0.02, bias_start=0.0,
           "bias",
           [output_size],
           initializer=tf.constant_initializer(bias_start))
+      bias = graph_spectral_norm(bias, init=bias_start)
       outputs += bias
     return outputs
 
@@ -688,6 +737,7 @@ def conv2d(inputs, output_dim, k_h, k_w, d_h, d_w, stddev=0.02, name="conv2d",
     if use_bias:
       bias = tf.get_variable(
           "bias", [output_dim], initializer=tf.constant_initializer(0.0))
+      bias = graph_spectral_norm(bias, init=0.0)
       outputs += bias
   return outputs
 
@@ -872,7 +922,211 @@ def non_local_block(x, name, use_sn):
 
     attn_g = tf.matmul(attn, g)
     attn_g = tf.reshape(attn_g, [-1, h, w, num_channels_g])
-    sigma = tf.get_variable("sigma", [], initializer=tf.zeros_initializer())
+    sigma = tf.get_variable("sigma", [], initializer=arch_ops.zeros_initializer())
+    sigma = graph_spectral_norm(sigma, init=0.0)
     attn_g = conv1x1(attn_g, num_channels, name="conv2d_attn_g", use_sn=use_sn,
                      use_bias=False)
+    # idea: Try abs(sigma). G's sigma always seems to train such that its value is negative.
+    # (This is mostly out of curiosity rather than effectiveness. I doubt abs(sigma) would
+    # force it to change much. But it would be interesting to check whether the conv layer
+    # just before sigma ends up inverting its own weights to compensate for abs(sigma).
     return x + sigma * attn_g
+
+
+@op_scope
+@gin.configurable(blacklist=['x', 'name'])
+def noise_block(x, name, randomize_noise=True, stddev=0.00, noise_multiplier=1.0):
+  logging.info("%s/noise_block(x=%s, name=%s, randomize_noise=%s, stddev=%s, noise_multiplier=%s)",
+               gin.current_scope_str(),
+               *[repr(v) for v in [x, name, randomize_noise, stddev, noise_multiplier]])
+  with tf.variable_scope(name):
+    N, H, W, C = tf.shape(x)[0], x.shape[1], x.shape[2], x.shape[3]
+    if randomize_noise:
+      noise = tf.random_normal(tf.shape(x), dtype=x.dtype)
+    else:
+      noise = tf.random_normal([H, W, C], dtype=x.dtype, seed=0)
+      noise = tf.tile([noise], [N, 1, 1, 1])
+    noise_strength = tf.get_variable('noise_strength', shape=[C], initializer=tf.initializers.random_normal(stddev=stddev), use_resource=True)
+    noise_strength = graph_spectral_norm(noise_strength, init=0.0)
+    x += noise * tf.cast(noise_strength * noise_multiplier, x.dtype)
+    return x
+
+
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.ops import init_ops
+
+
+def zeros(shape, dtype=dtypes.float32, name=None):
+  """Creates a tensor with all elements set to zero.
+
+  This operation returns a tensor of type `dtype` with shape `shape` and
+  all elements set to zero.
+
+  For example:
+
+  ```python
+  tf.zeros([3, 4], tf.int32)  # [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+  ```
+
+  Args:
+    shape: A list of integers, a tuple of integers, or a 1-D `Tensor` of type
+      `int32`.
+    dtype: The type of an element in the resulting `Tensor`.
+    name: A name for the operation (optional).
+
+  Returns:
+    A `Tensor` with all elements set to zero.
+  """
+  dtype = dtypes.as_dtype(dtype).base_dtype
+  with ops.name_scope(name, "zeros", [shape]) as name:
+    if dtype == dtypes.bool:
+      zero = False
+    elif dtype == dtypes.string:
+      zero = ""
+    else:
+      zero = 0
+
+    if not isinstance(shape, ops.Tensor):
+      try:
+        # Note from @theshawwn: I think this logic is somehow causing variables
+        # not to train the first time they're initialized; they remain at zero
+        # until the run restarts.
+
+        # # Create a constant if it won't be very big. Otherwise create a fill op
+        # # to prevent serialized GraphDefs from becoming too large.
+        # output = _constant_if_small(zero, shape, dtype, name)
+        # if output is not None:
+        #   return output
+
+        # Go through tensor shapes to get int64-if-needed semantics
+        shape = constant_op._tensor_shape_tensor_conversion_function(
+            tensor_shape.TensorShape(shape))
+      except (TypeError, ValueError):
+        # Happens when shape is a list with tensor elements
+        shape = ops.convert_to_tensor(shape, dtype=dtypes.int32)
+    if not shape._shape_tuple():
+      shape = tf.reshape(shape, [-1])  # Ensure it's a vector
+    output = tf.fill(shape, tf.constant(zero, dtype=dtype), name=name)
+  assert output.dtype.base_dtype == dtype
+  return output
+
+
+def ones(shape, dtype=dtypes.float32, name=None):
+  """Creates a tensor with all elements set to 1.
+
+  This operation returns a tensor of type `dtype` with shape `shape` and all
+  elements set to 1.
+
+  For example:
+
+  ```python
+  tf.ones([2, 3], tf.int32)  # [[1, 1, 1], [1, 1, 1]]
+  ```
+
+  Args:
+    shape: A list of integers, a tuple of integers, or a 1-D `Tensor` of type
+      `int32`.
+    dtype: The type of an element in the resulting `Tensor`.
+    name: A name for the operation (optional).
+
+  Returns:
+    A `Tensor` with all elements set to 1.
+  """
+  dtype = dtypes.as_dtype(dtype).base_dtype
+  with ops.name_scope(name, "ones", [shape]) as name:
+    one = True if dtype == dtypes.bool else 1
+    if not isinstance(shape, ops.Tensor):
+      try:
+        # Note from @theshawwn: I think this logic is somehow causing variables
+        # not to train the first time they're initialized; they remain at zero
+        # until the run restarts.
+
+        # # Create a constant if it won't be very big. Otherwise create a fill op
+        # # to prevent serialized GraphDefs from becoming too large.
+        # output = _constant_if_small(one, shape, dtype, name)
+        # if output is not None:
+        #   return output
+
+        # Go through tensor shapes to get int64-if-needed semantics
+        shape = constant_op._tensor_shape_tensor_conversion_function(
+            tensor_shape.TensorShape(shape))
+      except (TypeError, ValueError):
+        # Happens when shape is a list with tensor elements
+        shape = ops.convert_to_tensor(shape, dtype=dtypes.int32)
+    if not shape._shape_tuple():
+      shape = tf.reshape(shape, [-1])  # Ensure it's a vector
+    output = tf.fill(shape, tf.constant(one, dtype=dtype), name=name)
+  assert output.dtype.base_dtype == dtype
+  return output
+
+
+class Zeros(init_ops.Initializer):
+  """Initializer that generates tensors initialized to 0."""
+
+  def __call__(self, shape, dtype=dtypes.float32, partition_info=None):
+    dtype = dtypes.as_dtype(dtype)
+    return zeros(shape, dtype)
+
+
+class Ones(init_ops.Initializer):
+  """Initializer that generates tensors initialized to 1."""
+
+  def __call__(self, shape, dtype=dtypes.float32, partition_info=None):
+    """Returns a tensor object initialized as specified by the initializer.
+
+    Args:
+      shape: Shape of the tensor.
+      dtype: Optional dtype of the tensor. Only numeric or boolean dtypes are
+       supported.
+
+    Raises:
+      ValuesError: If the dtype is not numeric or boolean.
+    """
+    dtype = dtypes.as_dtype(dtype)
+    if not dtype.is_numpy_compatible or dtype == dtypes.string:
+      raise ValueError("Expected numeric or boolean dtype, got %s." % dtype)
+    return ones(shape, dtype)
+
+
+zeros_initializer = Zeros
+ones_initializer = Ones
+
+
+from tensorflow.python.eager import context
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import random_seed
+from tensorflow.python.framework import tensor_util
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import gen_random_ops
+from tensorflow.python.ops import math_ops
+
+
+@op_scope
+@gin.configurable(blacklist=['shape', 'dtype', 'seed', 'name'])
+def censored_normal(shape,
+                  mean=0.0,
+                  stddev=1.0,
+                  clip_min=0.0,
+                  clip_max=1.0,
+                  dtype=dtypes.float32,
+                  seed=None,
+                  name=None):
+
+  with ops.name_scope(name, "censored_normal", [shape, mean, stddev]) as name:
+    shape_tensor = tensor_util.shape_tensor(shape)
+    mean_tensor = ops.convert_to_tensor(mean, dtype=dtype, name="mean")
+    stddev_tensor = ops.convert_to_tensor(stddev, dtype=dtype, name="stddev")
+    seed1, seed2 = random_seed.get_seed(seed)
+    rnd = gen_random_ops.random_standard_normal(
+        shape_tensor, dtype, seed=seed1, seed2=seed2)
+    mul = rnd * stddev_tensor
+    value = math_ops.add(mul, mean_tensor, name=name)
+    value = tf.clip_by_value(value, clip_min, clip_max)
+    tensor_util.maybe_set_static_shape(value, shape)
+    return value
+

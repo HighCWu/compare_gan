@@ -79,6 +79,7 @@ from absl import logging
 from compare_gan.architectures import abstract_arch
 from compare_gan.architectures import arch_ops as ops
 from compare_gan.architectures import resnet_ops
+from compare_gan.architectures import stylegan_ops
 
 import gin
 from six.moves import range
@@ -94,6 +95,7 @@ class BigGanResNetBlock(resnet_ops.ResNetBlock):
 
   def __init__(self,
                add_shortcut=True,
+               use_relu=True,
                **kwargs):
     """Constructs a new ResNet block for BigGAN.
 
@@ -103,6 +105,7 @@ class BigGanResNetBlock(resnet_ops.ResNetBlock):
     """
     super(BigGanResNetBlock, self).__init__(**kwargs)
     self._add_shortcut = add_shortcut
+    self._use_relu = use_relu
 
   def apply(self, inputs, z, y, is_training):
     """"ResNet block containing possible down/up sampling, shared for G / D.
@@ -129,9 +132,13 @@ class BigGanResNetBlock(resnet_ops.ResNetBlock):
       outputs = self.batch_norm(
           outputs, z=z, y=y, is_training=is_training, name="bn1")
       if self._layer_norm:
+        logging.info("[Block] %s using layer_norm", inputs.shape)
         outputs = ops.layer_norm(outputs, is_training=is_training, scope="ln1")
 
-      outputs = tf.nn.relu(outputs)
+      if self._use_relu:
+        outputs = tf.nn.relu(outputs)
+      else:
+        logging.info("[Block] %s skipping relu", inputs.shape)
       outputs = self._get_conv(
           outputs, self._in_channels, self._out_channels, self._scale1,
           suffix="conv1")
@@ -141,7 +148,8 @@ class BigGanResNetBlock(resnet_ops.ResNetBlock):
       if self._layer_norm:
         outputs = ops.layer_norm(outputs, is_training=is_training, scope="ln2")
 
-      outputs = tf.nn.relu(outputs)
+      if self._use_relu:
+        outputs = tf.nn.relu(outputs)
       outputs = self._get_conv(
           outputs, self._out_channels, self._out_channels, self._scale2,
           suffix="conv2")
@@ -166,6 +174,7 @@ class Generator(abstract_arch.AbstractGenerator):
   def __init__(self,
                ch=96,
                blocks_with_attention="64",
+               stylegan_z=False,
                hierarchical_z=True,
                embed_z=False,
                embed_y=True,
@@ -173,6 +182,9 @@ class Generator(abstract_arch.AbstractGenerator):
                embed_bias=False,
                channel_multipliers=None,
                plain_tanh=False,
+               use_relu=True,
+               use_noise=False,
+               randomize_noise=True,
                **kwargs):
     """Constructor for BigGAN generator.
 
@@ -195,11 +207,17 @@ class Generator(abstract_arch.AbstractGenerator):
     self._blocks_with_attention.discard('')
     self._channel_multipliers = None if channel_multipliers is None else [int(x.strip()) for x in channel_multipliers.split(",")]
     self._hierarchical_z = hierarchical_z
+    self._stylegan_z = stylegan_z
     self._embed_z = embed_z
     self._embed_y = embed_y
     self._embed_y_dim = embed_y_dim
     self._embed_bias = embed_bias
     self._plain_tanh = plain_tanh
+    self._use_relu = use_relu
+    self._use_noise = use_noise
+    self._randomize_noise = randomize_noise
+    if hierarchical_z and stylegan_z:
+      raise ValueError("Must set either hierarchical_z or stylegan_z, not both")
 
   def _resnet_block(self, name, in_channels, out_channels, scale):
     """ResNet block for the generator."""
@@ -237,6 +255,11 @@ class Generator(abstract_arch.AbstractGenerator):
     out_channels = [self._ch * c for c in channel_multipliers[1:]]
     return in_channels, out_channels
 
+  @property
+  @gin.configurable("Generator_stylegan_z_args")
+  def G_main_args(self, **args):
+    return args
+
   def apply(self, z, y, is_training):
     """Build the generator network for the given inputs.
 
@@ -249,6 +272,10 @@ class Generator(abstract_arch.AbstractGenerator):
     Returns:
       A tensor of size [batch_size] + self._image_shape with values in [0, 1].
     """
+    with gin.config_scope("generator"):
+      return self._apply(z, y, is_training)
+
+  def _apply(self, z, y, is_training):
     shape_or_none = lambda t: None if t is None else t.shape
     logging.info("[Generator] inputs are z=%s, y=%s", z.shape, shape_or_none(y))
     # Each block upscales by a factor of 2.
@@ -264,8 +291,16 @@ class Generator(abstract_arch.AbstractGenerator):
     if self._embed_y:
       y = ops.linear(y, self._embed_y_dim, scope="embed_y", use_sn=False,
                      use_bias=self._embed_bias)
-    y_per_block = num_blocks * [y]
-    if self._hierarchical_z:
+    if self._stylegan_z:
+      z_args = self.G_main_args
+      z_args['is_training'] = z_args.pop('is_training', is_training)
+      tf.logging.info('[Generator] scope: %s stylegan_z_args: %s', gin.current_scope_str(), z_args)
+      z_per_block = stylegan_ops.G_main(num_blocks + 1, z, None, latent_size=z_dim, **z_args)
+      z_per_block = tf.unstack(z_per_block, axis=1)
+      z0, z_per_block = z_per_block[0], z_per_block[1:]
+      if y is not None:
+        y_per_block = [tf.concat([zi, y], 1) for zi in z_per_block]
+    elif self._hierarchical_z:
       z_per_block = tf.split(z, num_blocks + 1, axis=1)
       z0, z_per_block = z_per_block[0], z_per_block[1:]
       if y is not None:
@@ -273,6 +308,7 @@ class Generator(abstract_arch.AbstractGenerator):
     else:
       z0 = z
       z_per_block = num_blocks * [z]
+      y_per_block = num_blocks * [y]
 
     logging.info("[Generator] z0=%s, z_per_block=%s, y_per_block=%s",
                  z0.shape, [str(shape_or_none(t)) for t in z_per_block],
@@ -293,6 +329,8 @@ class Generator(abstract_arch.AbstractGenerator):
     blocks_with_attention = set(self._blocks_with_attention)
     for block_idx in range(num_blocks):
       name = "B{}".format(block_idx + 1)
+      if self._use_noise:
+        net = ops.noise_block(net, name=name, randomize_noise=self._randomize_noise)
       block = self._resnet_block(
           name=name,
           in_channels=in_channels[block_idx],
@@ -316,8 +354,13 @@ class Generator(abstract_arch.AbstractGenerator):
     # Final processing of the net.
     # Use unconditional batch norm.
     logging.info("[Generator] before final processing: %s", net.shape)
+    if self._use_noise:
+      net = ops.noise_block(net, name="final_norm", randomize_noise=self._randomize_noise)
     net = ops.batch_norm(net, is_training=is_training, name="final_norm")
-    net = tf.nn.relu(net)
+    if self._use_relu:
+      net = tf.nn.relu(net)
+    else:
+      logging.info("[Generator] skipping relu")
     net = ops.conv2d(net, output_dim=self._image_shape[2], k_h=3, k_w=3,
                      d_h=1, d_w=1, name="final_conv",
                      use_sn=self._spectral_norm)
@@ -338,6 +381,8 @@ class Discriminator(abstract_arch.AbstractDiscriminator):
                blocks_with_attention="64",
                project_y=True,
                channel_multipliers=None,
+               use_noise=False,
+               randomize_noise=True,
                **kwargs):
     """Constructor for BigGAN discriminator.
 
@@ -354,6 +399,8 @@ class Discriminator(abstract_arch.AbstractDiscriminator):
     self._blocks_with_attention.discard('')
     self._channel_multipliers = None if channel_multipliers is None else [int(x.strip()) for x in channel_multipliers.split(",")]
     self._project_y = project_y
+    self._use_noise = use_noise
+    self._randomize_noise = randomize_noise
 
   def _resnet_block(self, name, in_channels, out_channels, scale):
     """ResNet block for the generator."""
@@ -409,6 +456,10 @@ class Discriminator(abstract_arch.AbstractDiscriminator):
       before the final output activation function and logits form the second
       last layer.
     """
+    with gin.config_scope("discriminator"):
+      return self._apply(x, y, is_training)
+
+  def _apply(self, x, y, is_training):
     logging.info("[Discriminator] inputs are x=%s, y=%s", x.shape,
                  None if y is None else y.shape)
     resnet_ops.validate_image_inputs(x)
@@ -421,6 +472,8 @@ class Discriminator(abstract_arch.AbstractDiscriminator):
     blocks_with_attention = set(self._blocks_with_attention)
     for block_idx in range(num_blocks):
       name = "B{}".format(block_idx + 1)
+      if self._use_noise:
+        net = ops.noise_block(net, name=name, randomize_noise=self._randomize_noise)
       is_last_block = block_idx == num_blocks - 1
       block = self._resnet_block(
           name=name,
@@ -440,6 +493,8 @@ class Discriminator(abstract_arch.AbstractDiscriminator):
 
     # Final part
     logging.info("[Discriminator] before final processing: %s", net.shape)
+    if self._use_noise:
+      net = ops.noise_block(net, name="final_fc", randomize_noise=self._randomize_noise)
     net = tf.nn.relu(net)
     h = tf.math.reduce_sum(net, axis=[1, 2])
     out_logit = ops.linear(h, 1, scope="final_fc", use_sn=self._spectral_norm)
