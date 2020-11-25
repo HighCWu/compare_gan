@@ -57,6 +57,9 @@ def op_scope(fn, name=None):
 
 
 use_assign_forbidden = False
+sn_store_normed_weight = False
+sn_use_stored_normed_weight = False
+
 
 @gin.configurable("weights")
 def weight_initializer(initializer=consts.NORMAL_INIT, stddev=0.02):
@@ -660,6 +663,36 @@ def spectral_norm(inputs, epsilon=1e-12, singular_value="auto", use_resource=Tru
 
   # Deflate normalized weights to match the unnormalized tensor.
   w_tensor_normalized = tf.reshape(w_normalized, inputs.shape)
+  if sn_store_normed_weight:
+    var_weight_name = inputs.name.split(":")[0] + "/weight_normed"
+    var_norm_name = inputs.name.split(":")[0] + "/value_norm"
+    weight_normed = tf.get_variable(
+        var_weight_name,
+        shape=w_tensor_normalized.shape,
+        dtype=w_tensor_normalized.dtype,
+        initializer=tf.random_normal_initializer(),
+        collections=None,
+        use_resource=use_resource,
+        trainable=False)
+    value_norm = tf.get_variable(
+        var_norm_name,
+        shape=norm_value[0][0].shape,
+        dtype=norm_value[0][0].dtype,
+        initializer=tf.random_normal_initializer(),
+        collections=[tf.GraphKeys.LOCAL_VARIABLES],
+        use_resource=use_resource,
+        trainable=False)
+    if sn_use_stored_normed_weight:
+        tf.add_to_collection('to_be_dropped', inputs)
+        return weight_normed, value_norm
+
+    with tf.control_dependencies([
+        tf.assign(weight_normed, tf.stop_gradient(w_tensor_normalized), name='update_normed_weight'),
+        tf.assign(value_norm, tf.stop_gradient(norm_value[0][0]), name='update_norm_value')
+        ]):
+      w_tensor_normalized = tf.identity(w_tensor_normalized)
+      norm_value = tf.identity(norm_value)
+
   return w_tensor_normalized, norm_value[0][0]
 
 from compare_gan.tpu import tpu_summaries
