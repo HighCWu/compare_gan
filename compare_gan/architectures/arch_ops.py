@@ -641,7 +641,7 @@ def spectral_norm(inputs, epsilon=1e-12, singular_value="auto", use_resource=Tru
       u = tf.math.l2_normalize(tf.matmul(v, w), epsilon=epsilon)
 
   # Update the approximation.
-  if use_assign_forbidden:
+  if use_assign_forbidden or sn_store_normed_weight:
       u = tf.identity(u)
   else:
     with tf.control_dependencies([tf.assign(u_var, u, name="update_u")]):
